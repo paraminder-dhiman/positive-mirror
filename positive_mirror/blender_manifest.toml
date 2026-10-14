@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "positive_mirror"
+version = "1.0.0"
+name = "Positive Mirror"
+tagline = "Mirror objects with a live link and no negative scale"
+maintainer = "Paraminder Dhiman <paramindersd@gmail.com>"
+type = "add-on"
+website = "https://github.com/paraminder-dhiman/positive-mirror"
+
+tags = ["Object", "Pipeline"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Paraminder Dhiman"]
