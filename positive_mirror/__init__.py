@@ -1,5 +1,5 @@
+import math
 import bpy
-from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Matrix, Vector
@@ -28,7 +28,7 @@ def mirrored_matrix(source_matrix, plane_matrix, plane_axis, flip_axis):
     return world_flip @ source_matrix @ flip_matrix(flip_axis)
 
 def get_plane_matrix(plane_type, point, plane_object):
-    if plane_type == 'OBJECT':
+    if plane_object is not None:
         location, rotation, scale = plane_object.matrix_world.decompose()
         return Matrix.LocRotScale(location, rotation, None)
     return Matrix.Translation(point)
@@ -45,6 +45,64 @@ def set_transform_lock(obj, locked):
     obj.lock_rotation = (locked, locked, locked)
     obj.lock_rotation_w = locked
     obj.lock_scale = (locked, locked, locked)
+
+CONSTRAINT_NAME = "Positive Mirror"
+
+def link_constraints(obj):
+    return [constraint for constraint in obj.constraints if constraint.name.startswith(CONSTRAINT_NAME)]
+
+def remove_link_constraints(obj):
+    for constraint in link_constraints(obj):
+        obj.constraints.remove(constraint)
+
+def add_link_constraints(copy, live):
+    link = copy.positive_mirror_link
+    remove_link_constraints(copy)
+
+    location = copy.constraints.new('COPY_LOCATION')
+    setattr(location, "invert_" + link.plane_axis.lower(), True)
+    rotation = copy.constraints.new('COPY_ROTATION')
+    for axis in "XYZ":
+        if axis != link.plane_axis:
+            setattr(rotation, "invert_" + axis.lower(), True)
+    scale = copy.constraints.new('COPY_SCALE')
+    added = [location, rotation, scale]
+
+    for constraint in added:
+        constraint.target = link.source
+        if link.plane_object is not None:
+            constraint.owner_space = 'CUSTOM'
+            constraint.target_space = 'CUSTOM'
+            constraint.space_object = link.plane_object
+
+    if link.flip_axis != link.plane_axis:
+        third = ({'X', 'Y', 'Z'} - {link.plane_axis, link.flip_axis}).pop().lower()
+        turn = copy.constraints.new('TRANSFORM')
+        turn.target = link.source
+        turn.map_to = 'ROTATION'
+        turn.owner_space = 'LOCAL'
+        turn.mix_mode_rot = 'AFTER'
+        setattr(turn, "to_min_" + third + "_rot", math.pi)
+        setattr(turn, "to_max_" + third + "_rot", math.pi)
+        added.append(turn)
+
+    for constraint in added:
+        constraint.name = CONSTRAINT_NAME + " " + constraint.name
+        constraint.mute = not live
+
+def make_mirror_plane(context, point, follow):
+    plane = bpy.data.objects.new("Mirror Plane", None)
+    plane.empty_display_type = 'ARROWS'
+    plane.location = point
+    context.collection.objects.link(plane)
+    if follow is not None:
+        plane.name = "Mirror Plane · " + follow.name
+        plane.matrix_world = get_plane_matrix('OBJECT', point, follow)
+        for kind in ('COPY_LOCATION', 'COPY_ROTATION'):
+            constraint = plane.constraints.new(kind)
+            constraint.target = follow
+        plane.hide_set(True)
+    return plane
 
 def get_target_matrix(copy):
     link = copy.positive_mirror_link
@@ -66,9 +124,15 @@ def sync_copy(copy):
 
 def unlink_copy(obj):
     link = obj.positive_mirror_link
+    obj.matrix_world = obj.matrix_world.copy()
+    remove_link_constraints(obj)
+    plane = link.plane_object
     link.source = None
     link.plane_object = None
     set_transform_lock(obj, False)
+    if link.plane_type != 'WORLD' and plane is not None:
+        if not any(other.positive_mirror_link.plane_object == plane for other in bpy.data.objects):
+            bpy.data.objects.remove(plane)
 
 def find_broken_links(scene):
     scene_objects = set(scene.objects)
@@ -76,9 +140,14 @@ def find_broken_links(scene):
     for obj in scene_objects:
         link = obj.positive_mirror_link
         if link.source is None:
+            if link_constraints(obj):
+                broken.append((obj, True))
             continue
         source_gone = link.source not in scene_objects
-        plane_gone = link.plane_type == 'OBJECT' and link.plane_object not in scene_objects
+        plane_gone = link.plane_type != 'WORLD' and (
+            link.plane_object not in scene_objects
+            or any(constraint.target not in scene_objects for constraint in link.plane_object.constraints)
+        )
         if source_gone or plane_gone:
             broken.append((obj, source_gone))
     return broken
@@ -95,42 +164,17 @@ def clean_broken_links(scene):
                 unlink_copy(obj)
         broken = find_broken_links(scene)
 
-def sync_scene(scene):
+def refresh_scene(scene):
     clean_broken_links(scene)
-    updated = 0
+    restored = 0
     for obj in scene.objects:
-        if sync_copy(obj):
-            updated += 1
-    return updated
-
-is_syncing = False
-
-def live_sync(scene):
-    global is_syncing
-    if is_syncing or not scene.positive_mirror.live_link:
-        return
-    if bpy.app.is_job_running('RENDER'):
-        return
-
-    is_syncing = True
-    try:
-        sync_scene(scene)
-    finally:
-        is_syncing = False
-
-@persistent
-def positive_mirror_on_depsgraph_update(scene, depsgraph):
-    if depsgraph.id_type_updated('OBJECT'):
-        live_sync(scene)
-
-@persistent
-def positive_mirror_on_frame_change(scene, depsgraph):
-    live_sync(scene)
-
-def remove_handler(handler_list, name):
-    for handler in list(handler_list):
-        if handler.__name__ == name:
-            handler_list.remove(handler)
+        if obj.positive_mirror_link.source is None:
+            continue
+        if not link_constraints(obj):
+            add_link_constraints(obj, scene.positive_mirror.live_link)
+            restored += 1
+        sync_copy(obj)
+    return restored
 
 def find_opposite_mesh(source):
     if source.type != 'MESH':
@@ -154,8 +198,14 @@ def mirrored_name(name):
     return name + "_mirror"
 
 def on_live_link_changed(self, context):
-    if self.live_link:
-        sync_scene(context.scene)
+    for obj in context.scene.objects:
+        constraints = link_constraints(obj)
+        if not constraints:
+            continue
+        if not self.live_link:
+            obj.matrix_world = obj.matrix_world.copy()
+        for constraint in constraints:
+            constraint.mute = not self.live_link
 
 HELP_SECTIONS = (
     ("1 · Mirror", (
@@ -166,7 +216,8 @@ HELP_SECTIONS = (
     )),
     ("2 · Mirror Plane", (
         "World mirrors across a world axis through the origin",
-        "3D Cursor uses the cursor position at the moment you mirror",
+        "3D Cursor adds a Mirror Plane empty at the cursor",
+        "Move or rotate that empty to move the plane",
         "Object mirrors across a local axis of the chosen object",
     )),
     ("3 · Flip Axis", (
@@ -179,11 +230,11 @@ HELP_SECTIONS = (
         "An asymmetric mesh with no pair will not look mirrored",
     )),
     ("5 · Links", (
-        "Copies follow their source and are locked",
-        "Live Link updates them as you work, Refresh does it on demand",
+        "Copies follow their source through constraints and are locked",
+        "Turning Live Link off freezes copies where they are",
         "Unlink Selected turns copies into normal objects",
-        "Deleting a source unlinks its copies, or deletes them if ticked",
-        "The add-on must be enabled for copies to follow",
+        "After deleting a source, press Refresh to unlink its copies",
+        "Tick Delete copies with source to delete them instead",
     )),
 )
 
@@ -204,7 +255,7 @@ class POSMIRROR_Settings(PropertyGroup):
     )
     live_link: BoolProperty(
         name="Live Link",
-        description="Keep linked copies in sync while their sources move",
+        description="Keep linked copies following their sources. When off, copies stay where they are",
         default=True,
         update=on_live_link_changed,
     )
@@ -246,6 +297,9 @@ class POSMIRROR_OT_mirror(Operator):
         if not sources:
             self.report({'ERROR'}, "Only the mirror object is selected")
             return {'CANCELLED'}
+        plane_object = None
+        if settings.plane_type != 'WORLD':
+            plane_object = make_mirror_plane(context, point, settings.plane_object if settings.plane_type == 'OBJECT' else None)
         copies = []
         paired = 0
         for source in sources:
@@ -263,11 +317,12 @@ class POSMIRROR_OT_mirror(Operator):
             link.plane_type = settings.plane_type
             link.plane_axis = settings.plane_axis
             link.plane_point = point
-            link.plane_object = settings.plane_object if settings.plane_type == 'OBJECT' else None
+            link.plane_object = plane_object
             link.flip_axis = settings.flip_axis
 
             set_transform_lock(copy, True)
             sync_copy(copy)
+            add_link_constraints(copy, settings.live_link)
             copies.append(copy)
 
         for obj in context.selected_objects:
@@ -293,13 +348,14 @@ class POSMIRROR_OT_mirror(Operator):
 class POSMIRROR_OT_refresh(Operator):
     bl_idname = "posmirror.refresh"
     bl_label = "Refresh Links"
-    bl_description = "Move every linked copy in the scene to match its source"
+    bl_description = "Tidy up copies whose source or mirror plane was deleted, and restore missing links"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        updated = sync_scene(context.scene)
-        self.report({'INFO'}, f"Updated {updated} linked copy(s)")
-        return{'FINISHED'}
+        broken = len(find_broken_links(context.scene))
+        restored = refresh_scene(context.scene)
+        self.report({'INFO'}, f"Tidied {broken} copy(s) · restored {restored} link(s)")
+        return {'FINISHED'}
 
 
 class POSMIRROR_OT_unlink(Operator):
@@ -373,6 +429,9 @@ class POSMIRROR_PT_panel(Panel):
         box.label(text="Links", icon='LINKED')
         box.prop(settings, "live_link")
         box.prop(settings, "delete_with_source")
+        broken = len(find_broken_links(context.scene))
+        if broken:
+            box.label(text=f"{broken} copy(s) lost their source · press Refresh", icon='ERROR')
         box.operator("posmirror.refresh", icon='FILE_REFRESH')
         box.operator("posmirror.unlink", icon='UNLINKED')
 
@@ -404,17 +463,11 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.positive_mirror = PointerProperty(type=POSMIRROR_Settings)
     bpy.types.Object.positive_mirror_link = PointerProperty(type=POSMIRROR_Link)
-    remove_handler(bpy.app.handlers.depsgraph_update_post, "positive_mirror_on_depsgraph_update")
-    remove_handler(bpy.app.handlers.frame_change_post, "positive_mirror_on_frame_change")
-    bpy.app.handlers.depsgraph_update_post.append(positive_mirror_on_depsgraph_update)
-    bpy.app.handlers.frame_change_post.append(positive_mirror_on_frame_change)
     bpy.types.VIEW3D_MT_mirror.append(draw_mirror_menu)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_mirror.remove(draw_mirror_menu)
-    remove_handler(bpy.app.handlers.depsgraph_update_post, "positive_mirror_on_depsgraph_update")
-    remove_handler(bpy.app.handlers.frame_change_post, "positive_mirror_on_frame_change")
     del bpy.types.Object.positive_mirror_link
     del bpy.types.Scene.positive_mirror
     for cls in reversed(classes):

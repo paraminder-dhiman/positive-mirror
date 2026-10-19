@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "positive_mirror"
-version = "1.0.0"
+version = "1.1.0"
 name = "Positive Mirror"
 tagline = "Mirror objects with a live link and no negative scale"
 maintainer = "Paraminder Dhiman <paramindersd@gmail.com>"
